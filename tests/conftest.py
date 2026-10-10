@@ -1,4 +1,5 @@
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import AbstractContextManager, contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -30,6 +31,27 @@ class InMemoryEventPublisher:
         pass
 
 
+class InMemoryDeadLetterPublisher:
+    """DeadLetterPublisher fake that records messages instead of sending them."""
+
+    def __init__(self, call_log: list[str] | None = None) -> None:
+        self.messages: list[tuple[bytes | None, bytes | None, list[tuple[str, bytes]]]] = []
+        self.fail = False
+        # optional log shared with other fakes to check call ordering
+        self._call_log = call_log if call_log is not None else []
+
+    def publish(
+        self, key: bytes | None, value: bytes | None, headers: list[tuple[str, bytes]]
+    ) -> None:
+        if self.fail:
+            raise PublishError("simulated dead-letter publish failure")
+        self._call_log.append("dead_letter")
+        self.messages.append((key, value, headers))
+
+    def close(self) -> None:
+        pass
+
+
 def _assert_safe_test_database(url: str) -> None:
     if url == DATABASE_URL:
         raise RuntimeError(
@@ -48,6 +70,23 @@ _assert_safe_test_database(TEST_DATABASE_URL)
 
 test_engine = create_engine(TEST_DATABASE_URL)
 TestSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
+
+
+def borrowed_session_factory(
+    session: Session,
+) -> Callable[[], AbstractContextManager[Session]]:
+    """Session factory for process_message that hands out an existing session.
+
+    process_message closes the session it opens; this yields the given one
+    without closing it, so the caller (usually the db_session fixture) keeps
+    ownership.
+    """
+
+    @contextmanager
+    def factory() -> Iterator[Session]:
+        yield session
+
+    return factory
 
 
 @pytest.fixture(scope="session", autouse=True)

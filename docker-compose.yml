@@ -43,24 +43,22 @@ services:
       timeout: 10s
       retries: 12
 
-  # One-shot job: creates the events topic explicitly (auto-creation is off).
+  # One-shot job: creates the events and dead-letter topics explicitly
+  # (auto-creation is off). The DLQ is low-volume, so one partition suffices.
   kafka-init:
     image: apache/kafka:3.8.0
     depends_on:
       kafka:
         condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - /opt/kafka/bin/kafka-topics.sh
-      - --bootstrap-server
-      - kafka:19092
-      - --create
-      - --if-not-exists
-      - --topic
-      - ${KAFKA_EVENTS_TOPIC:-events}
-      - --partitions
-      - "3"
-      - --replication-factor
-      - "1"
+      - >-
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092
+        --create --if-not-exists --topic ${KAFKA_EVENTS_TOPIC:-events}
+        --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092
+        --create --if-not-exists --topic ${KAFKA_DLQ_TOPIC:-events.dlq}
+        --partitions 1 --replication-factor 1
     restart: "no"
 
 volumes:

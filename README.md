@@ -24,9 +24,10 @@ an API for downstream consumers.
   repository layers, separate test database).
 - **v0.3 — implemented.** Query and stats API (`GET /v1/events`,
   `GET /v1/events/stats`), duplicate `event_id` handling (409 Conflict).
-
 - **v0.4 — implemented.** Kafka ingestion: `POST /v1/events` publishes to a
   topic and returns `202 Accepted`; a separate consumer persists events.
+- **v0.5 — implemented.** Dead-letter topic: messages the consumer cannot
+  process are preserved on `events.dlq` instead of being dropped.
 
 Redis, Docker image, and monitoring are not implemented yet. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
@@ -35,8 +36,11 @@ Redis, Docker image, and monitoring are not implemented yet. See
 
 ```
 client -> API (POST /v1/events) -> Kafka topic "events" -> consumer -> PostgreSQL
-                                                                        ^
-client -> API (GET /v1/events, GET /v1/events/stats) -------------------+
+                                                              |          ^
+                                       rejected messages      v          |
+                                             Kafka topic "events.dlq"    |
+                                                                         |
+client -> API (GET /v1/events, GET /v1/events/stats) --------------------+
 ```
 
 - The API validates the event and publishes it as JSON to the `events`
@@ -53,12 +57,13 @@ client -> API (GET /v1/events, GET /v1/events/stats) -------------------+
   `ON CONFLICT (event_id) DO NOTHING`. It commits the Kafka offset only after
   the database transaction is committed, so delivery is at-least-once and
   redelivered messages are harmless.
-  - Malformed or invalid messages (same validation as the API) are logged
-    and skipped, and their offset is committed.
-  - Messages the database rejects as such (`DataError`, `IntegrityError`)
-    would fail on every retry, so they are logged at error level with topic,
-    partition and offset, skipped, and their offset is committed. A
-    dead-letter topic for these is planned (see the roadmap).
+  - Messages that can never be processed are forwarded to the dead-letter
+    topic (see [Dead-letter topic](#dead-letter-topic)) and their offset is
+    committed: malformed or invalid payloads (same validation as the API),
+    and valid events the database rejects as such (`DataError`,
+    `IntegrityError`), which would fail on every retry.
+  - If forwarding to the dead-letter topic fails, the consumer exits
+    non-zero without committing the offset, so nothing is lost.
   - On any other database error (e.g. lost connection: `OperationalError`,
     `InterfaceError`) the consumer exits non-zero without committing the
     offset; the message is redelivered when it restarts.
@@ -71,6 +76,36 @@ client -> API (GET /v1/events, GET /v1/events/stats) -------------------+
   "stored": the event shows up in the GET endpoints once the consumer has
   processed it. A duplicate `event_id` is accepted by the API and silently
   ignored by the consumer (the 409 response from v0.3 is gone).
+
+### Dead-letter topic
+
+Rejected messages go to `KAFKA_DLQ_TOPIC` (default `events.dlq`), keyed and
+valued exactly as the original, so they can be inspected or replayed by
+hand. Duplicates are normal behaviour and are not dead-lettered. The reason
+is carried in headers:
+
+| Header                   | Value                                           |
+|--------------------------|-------------------------------------------------|
+| `dlq.error.category`     | `invalid_payload` or `database_rejected`        |
+| `dlq.error.detail`       | error description, truncated to 1000 characters |
+| `dlq.original.topic`     | topic the message was read from                 |
+| `dlq.original.partition` | its partition                                   |
+| `dlq.original.offset`    | its offset                                      |
+
+The consumer waits for the broker to acknowledge the dead-letter copy before
+committing the original offset. A dead-letter copy whose acknowledgement
+timed out may still be delivered, in which case the message is dead-lettered
+again after the restart, so the topic can contain duplicates. There is no
+automatic replay.
+
+Read the topic with the console consumer inside the Kafka container:
+
+```
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh   --bootstrap-server localhost:9092 --topic events.dlq --from-beginning   --property print.key=true --property print.headers=true
+```
+
+In Git Bash on Windows, prefix the command with `MSYS_NO_PATHCONV=1` so the
+container path isn't rewritten into a Windows path.
 
 ## Project Structure
 
@@ -94,18 +129,20 @@ docker compose up -d
 ```
 
 The one-shot `kafka-init` service creates the `events` topic with 3
-partitions (topic auto-creation is disabled on the broker). The broker has no
-volume, so its data is discarded by `docker compose down`; the topic is
-recreated on the next `up`.
+partitions and the `events.dlq` dead-letter topic with 1 partition (topic
+auto-creation is disabled on the broker). The broker has no volume, so its
+data is discarded by `docker compose down`; the topics are recreated on the
+next `up`.
 
 Configuration (environment variables, see `.env.example`):
 
-| Variable                  | Default                                                               |
-|---------------------------|-----------------------------------------------------------------------|
+| Variable                  | Default                                                                 |
+|---------------------------|-------------------------------------------------------------------------|
 | `DATABASE_URL`            | `postgresql+psycopg://postgres:postgres@localhost:5432/event_analytics` |
-| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092`                                                      |
-| `KAFKA_EVENTS_TOPIC`      | `events`                                                              |
-| `KAFKA_CONSUMER_GROUP`    | `event-consumer`                                                      |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092`                                                        |
+| `KAFKA_EVENTS_TOPIC`      | `events`                                                                |
+| `KAFKA_DLQ_TOPIC`         | `events.dlq`                                                            |
+| `KAFKA_CONSUMER_GROUP`    | `event-consumer`                                                        |
 
 Start the API:
 
@@ -138,10 +175,11 @@ always tests against the current models. The default run needs only
 PostgreSQL: the API tests replace the Kafka publisher with an in-memory fake,
 and the consumer's message handling is tested without a broker.
 
-### Integration test (Kafka)
+### Integration tests (Kafka)
 
-One end-to-end test (POST -> Kafka -> consumer logic -> row in PostgreSQL) is
-marked `integration` and excluded from the default run. With
+Two end-to-end tests are marked `integration` and excluded from the default
+run: POST -> Kafka -> consumer logic -> row in PostgreSQL, and an invalid
+message on `events` -> consumer logic -> `events.dlq` with its headers. With
 `docker compose up -d` running:
 
 ```

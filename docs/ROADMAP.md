@@ -7,11 +7,11 @@
 - v0.3 - Query and stats API; duplicate event_id handling
 - v0.4 - Kafka ingestion: the API publishes to a topic, a separate
   consumer persists events
+- v0.5 - Dead-letter topic for unprocessable messages
 
 ## Planned
-- v0.5 - Redis: caching of aggregates, duplicate detection
-- v0.6 - App Dockerfile, Alembic migrations, Prometheus metrics
-- Dead-letter topic for unprocessable messages
+- v0.6 - Redis: caching of aggregates, duplicate detection
+- v0.7 - App Dockerfile, Alembic migrations, Prometheus metrics
 
 ## Working agreement
 - One version per commit, message "Implement v0.X <summary>", pushed to main.

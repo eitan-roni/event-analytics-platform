@@ -21,34 +21,34 @@ class EventPublisher(Protocol):
     def close(self) -> None: ...
 
 
-class KafkaEventPublisher:
-    """Publishes events to a Kafka topic with one long-lived Producer.
+class KafkaProducerClient:
+    """A Producer plus a blocking send() that waits for the delivery report.
 
-    confluent-kafka's Producer is thread-safe, so a single instance is shared
-    by all request-handling threads.
+    Shared by the event and dead-letter publishers. confluent-kafka's
+    Producer is thread-safe, so one instance can serve many threads.
     """
 
-    def __init__(
-        self,
-        bootstrap_servers: str,
-        topic: str,
-        timeout_seconds: float = DEFAULT_PUBLISH_TIMEOUT_SECONDS,
-    ) -> None:
-        self._topic = topic
+    def __init__(self, bootstrap_servers: str, timeout_seconds: float) -> None:
         self._timeout_seconds = timeout_seconds
         self._producer = Producer(
             {
                 "bootstrap.servers": bootstrap_servers,
                 "acks": "all",
                 "enable.idempotence": True,
-                # librdkafka gives up on the message at the same time publish()
+                # librdkafka gives up on the message at the same time send()
                 # stops waiting, so a message we reported as failed is unlikely
                 # to be delivered later.
                 "message.timeout.ms": int(timeout_seconds * 1000),
             }
         )
 
-    def publish(self, key: str, value: bytes) -> None:
+    def send(
+        self,
+        topic: str,
+        key: bytes | None,
+        value: bytes | None,
+        headers: list[tuple[str, bytes]] | None = None,
+    ) -> None:
         delivered = threading.Event()
         errors: list[KafkaError] = []
 
@@ -59,7 +59,7 @@ class KafkaEventPublisher:
 
         try:
             self._producer.produce(
-                self._topic, key=key.encode("utf-8"), value=value, on_delivery=on_delivery
+                topic, key=key, value=value, headers=headers, on_delivery=on_delivery
             )
         except (BufferError, KafkaException) as exc:
             raise PublishError(f"Failed to enqueue message: {exc}") from exc
@@ -78,5 +78,24 @@ class KafkaEventPublisher:
         if errors:
             raise PublishError(f"Delivery failed: {errors[0]}")
 
-    def close(self) -> None:
+    def flush(self) -> None:
         self._producer.flush(DEFAULT_FLUSH_TIMEOUT_SECONDS)
+
+
+class KafkaEventPublisher:
+    """Publishes events to a Kafka topic with one long-lived Producer."""
+
+    def __init__(
+        self,
+        bootstrap_servers: str,
+        topic: str,
+        timeout_seconds: float = DEFAULT_PUBLISH_TIMEOUT_SECONDS,
+    ) -> None:
+        self._topic = topic
+        self._producer = KafkaProducerClient(bootstrap_servers, timeout_seconds)
+
+    def publish(self, key: str, value: bytes) -> None:
+        self._producer.send(self._topic, key=key.encode("utf-8"), value=value)
+
+    def close(self) -> None:
+        self._producer.flush()
