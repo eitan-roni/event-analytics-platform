@@ -4,8 +4,8 @@ from collections.abc import Callable
 from types import FrameType
 from typing import Protocol
 
-from confluent_kafka import Consumer, Message
-from sqlalchemy.exc import SQLAlchemyError
+from confluent_kafka import Consumer, KafkaException, Message
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.consumer.handler import MessageOutcome, handle_message
@@ -37,12 +37,35 @@ def process_message(
 
     The DB transaction is committed inside handle_message, so the offset is
     only committed once the event is durably stored (or deliberately skipped).
-    A database error propagates before the commit, so the message will be
-    redelivered.
+
+    DataError / IntegrityError are specific to the message and would fail on
+    every redelivery, so the message is rejected and its offset committed.
+    Any other database error (e.g. OperationalError, InterfaceError) propagates
+    before the commit, so the message will be redelivered.
     """
+    location = f"{message.topic()}[{message.partition()}]@{message.offset()}"
     with session_factory() as session:
-        outcome = handle_message(message.value(), EventService(EventRepository(session)))
-    consumer.commit(message=message, asynchronous=False)
+        try:
+            outcome = handle_message(
+                message.value(), EventService(EventRepository(session))
+            )
+        except (DataError, IntegrityError) as exc:
+            session.rollback()
+            logger.error(
+                "Rejecting unprocessable message %s: %s: %s",
+                location,
+                type(exc.orig or exc).__name__,
+                exc.orig or exc,
+            )
+            outcome = MessageOutcome.REJECTED
+
+    try:
+        consumer.commit(message=message, asynchronous=False)
+    except KafkaException as exc:
+        if exc.args[0].fatal():
+            raise
+        # The message will be redelivered; the insert is idempotent.
+        logger.warning("Failed to commit offset for %s: %s", location, exc)
     return outcome
 
 
@@ -99,6 +122,10 @@ def main() -> int:
                     message.partition(),
                     message.offset(),
                 )
+                return 1
+            except KafkaException as exc:
+                # process_message only re-raises fatal commit errors
+                logger.error("Fatal Kafka error while committing offset: %s", exc)
                 return 1
             logger.debug(
                 "%s[%s]@%s: %s",

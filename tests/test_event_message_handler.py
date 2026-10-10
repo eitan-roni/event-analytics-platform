@@ -52,6 +52,9 @@ def test_duplicate_message_leaves_exactly_one_row(db_session: Session) -> None:
         pytest.param(b"\xff\xfe\x00", id="invalid-utf8"),
         pytest.param(b'{"event_id": "evt-x", "severity": "URGENT"}', id="invalid-schema"),
         pytest.param(b"[]", id="wrong-json-type"),
+        pytest.param(VALID_MESSAGE.replace(b"server-01", b"server\u000001"), id="nul-in-source"),
+        pytest.param(VALID_MESSAGE.replace(b'"evt-msg-1"', b'""'), id="empty-event-id"),
+        pytest.param(VALID_MESSAGE.replace(b"92.5", b"1e400"), id="infinite-value"),
         pytest.param(None, id="no-value"),
     ],
 )

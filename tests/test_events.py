@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -73,6 +74,35 @@ def test_create_event_invalid_timestamp(
     payload = {**VALID_PAYLOAD, "timestamp": "not-a-timestamp"}
     response = client.post("/v1/events", json=payload)
     assert response.status_code == 422
+    assert fake_publisher.messages == []
+
+
+@pytest.mark.parametrize("field", ["event_id", "source", "event_type"])
+@pytest.mark.parametrize(
+    "bad_value",
+    [pytest.param("", id="empty"), pytest.param("server\u000001", id="nul")],
+)
+def test_create_event_invalid_string_field(
+    client: TestClient, fake_publisher: InMemoryEventPublisher, field: str, bad_value: str
+) -> None:
+    payload = {**VALID_PAYLOAD, field: bad_value}
+    response = client.post("/v1/events", json=payload)
+    assert response.status_code == 422
+    assert fake_publisher.messages == []
+
+
+@pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity", "1e400"])
+def test_create_event_non_finite_value(
+    client: TestClient, fake_publisher: InMemoryEventPublisher, bad_value: str
+) -> None:
+    # Python's json module accepts these non-standard literals (1e400
+    # overflows to inf), and httpx won't serialize them, so send raw bytes.
+    body = json.dumps({**VALID_PAYLOAD, "value": 0}).replace('"value": 0', f'"value": {bad_value}')
+    response = client.post(
+        "/v1/events", content=body, headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["type"] == "finite_number"
     assert fake_publisher.messages == []
 
 

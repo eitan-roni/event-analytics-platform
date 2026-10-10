@@ -13,6 +13,8 @@ class MessageOutcome(str, Enum):
     STORED = "stored"
     DUPLICATE = "duplicate"
     SKIPPED = "skipped"
+    # valid message that the database refuses (e.g. DataError); never retried
+    REJECTED = "rejected"
 
 
 def handle_message(raw: bytes | None, service: EventService) -> MessageOutcome:

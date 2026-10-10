@@ -39,20 +39,33 @@ client -> API (POST /v1/events) -> Kafka topic "events" -> consumer -> PostgreSQ
 client -> API (GET /v1/events, GET /v1/events/stats) -------------------+
 ```
 
-- The API validates the event (422 on invalid input) and publishes it as
-  JSON to the `events` topic, keyed by `source` (so events from one source
+- The API validates the event and publishes it as JSON to the `events`
+  topic, keyed by `source` (so events from one source
   keep their order within a partition). It waits for the broker's
   acknowledgement (`acks=all`, idempotent producer) and returns `202
   Accepted`, or `503` if the event could not be published in time. The API
-  does not write to the database.
+  does not write to the database. Invalid input returns `422` and nothing is
+  published; besides the field types, `event_id`, `source` and `event_type`
+  must be non-empty and free of NUL characters (PostgreSQL text cannot store
+  them), and `value` must be a finite number (no `NaN` / `Infinity`).
 - The consumer (`python -m app.consumer`) reads the topic as consumer group
   `KAFKA_CONSUMER_GROUP` and inserts each event with
   `ON CONFLICT (event_id) DO NOTHING`. It commits the Kafka offset only after
   the database transaction is committed, so delivery is at-least-once and
   redelivered messages are harmless.
-  - Malformed or invalid messages are logged and skipped.
-  - On a database error the consumer exits non-zero without committing the
+  - Malformed or invalid messages (same validation as the API) are logged
+    and skipped, and their offset is committed.
+  - Messages the database rejects as such (`DataError`, `IntegrityError`)
+    would fail on every retry, so they are logged at error level with topic,
+    partition and offset, skipped, and their offset is committed. A
+    dead-letter topic for these is planned (see the roadmap).
+  - On any other database error (e.g. lost connection: `OperationalError`,
+    `InterfaceError`) the consumer exits non-zero without committing the
     offset; the message is redelivered when it restarts.
+  - If committing an offset fails with a non-fatal Kafka error (e.g. during
+    a rebalance), the failure is logged and consumption continues; the
+    message may be redelivered, which the idempotent insert makes harmless.
+    A fatal Kafka error stops the consumer with a non-zero exit.
   - It stops cleanly on Ctrl+C / SIGTERM.
 - Because persistence is asynchronous, a `202` means "queued", not
   "stored": the event shows up in the GET endpoints once the consumer has
