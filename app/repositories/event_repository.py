@@ -1,9 +1,7 @@
-from psycopg.errors import UniqueViolation
 from sqlalchemy import Select, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import DuplicateEventError
 from app.models.event import EventORM
 from app.schemas.event import EventFilters
 
@@ -12,17 +10,29 @@ class EventRepository:
     def __init__(self, db: Session) -> None:
         self._db = db
 
-    def create(self, event: EventORM) -> EventORM:
-        self._db.add(event)
-        try:
-            self._db.commit()
-        except IntegrityError as exc:
-            self._db.rollback()
-            if isinstance(exc.orig, UniqueViolation):
-                raise DuplicateEventError(event.event_id) from exc
-            raise
-        self._db.refresh(event)
-        return event
+    def insert_if_absent(self, event: EventORM) -> bool:
+        """Insert and commit; returns False if the event_id already exists.
+
+        ON CONFLICT DO NOTHING makes redelivered messages harmless.
+        """
+        stmt = (
+            insert(EventORM)
+            .values(
+                event_id=event.event_id,
+                source=event.source,
+                event_type=event.event_type,
+                severity=event.severity,
+                timestamp=event.timestamp,
+                value=event.value,
+            )
+            .on_conflict_do_nothing(index_elements=[EventORM.event_id])
+            # RETURNING yields no row on conflict; rowcount isn't reliable
+            # for ORM-enabled inserts executed through a Session.
+            .returning(EventORM.id)
+        )
+        inserted_id = self._db.execute(stmt).scalar_one_or_none()
+        self._db.commit()
+        return inserted_id is not None
 
     def list_events(self, filters: EventFilters, limit: int, offset: int) -> list[EventORM]:
         stmt = self._apply_filters(select(EventORM), filters)

@@ -1,10 +1,11 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import DuplicateEventError
+from app.core.exceptions import PublishError
 from app.db.session import get_db
+from app.messaging.publisher import EventPublisher
 from app.repositories.event_repository import EventRepository
 from app.schemas.event import (
     EventAccepted,
@@ -15,8 +16,13 @@ from app.schemas.event import (
     Severity,
 )
 from app.services.event_service import EventService
+from app.services.ingestion_service import EventIngestionService
 
 router = APIRouter(prefix="/v1", tags=["events"])
+
+
+def get_event_publisher(request: Request) -> EventPublisher:
+    return request.app.state.event_publisher
 
 
 def get_event_filters(
@@ -35,13 +41,18 @@ def get_event_filters(
     )
 
 
-@router.post("/events", response_model=EventAccepted, status_code=status.HTTP_201_CREATED)
-def create_event(event: EventCreate, db: Session = Depends(get_db)) -> EventAccepted:
-    service = EventService(EventRepository(db))
+@router.post("/events", response_model=EventAccepted, status_code=status.HTTP_202_ACCEPTED)
+def create_event(
+    event: EventCreate, publisher: EventPublisher = Depends(get_event_publisher)
+) -> EventAccepted:
+    service = EventIngestionService(publisher)
     try:
         return service.ingest(event)
-    except DuplicateEventError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except PublishError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Event could not be queued for processing; retry later",
+        ) from exc
 
 
 @router.get("/events", response_model=EventListResponse)

@@ -5,11 +5,29 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.api.events import get_event_publisher
 from app.core.config import DATABASE_URL, TEST_DATABASE_URL
+from app.core.exceptions import PublishError
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
 from app.models.event import EventORM
+
+
+class InMemoryEventPublisher:
+    """EventPublisher fake that records messages instead of sending them."""
+
+    def __init__(self) -> None:
+        self.messages: list[tuple[str, bytes]] = []
+        self.fail = False
+
+    def publish(self, key: str, value: bytes) -> None:
+        if self.fail:
+            raise PublishError("simulated publish failure")
+        self.messages.append((key, value))
+
+    def close(self) -> None:
+        pass
 
 
 def _assert_safe_test_database(url: str) -> None:
@@ -52,14 +70,23 @@ def db_session() -> Generator[Session, None, None]:
 
 
 @pytest.fixture
-def client(db_session: Session) -> Generator[TestClient, None, None]:
+def fake_publisher() -> InMemoryEventPublisher:
+    return InMemoryEventPublisher()
+
+
+@pytest.fixture
+def client(
+    db_session: Session, fake_publisher: InMemoryEventPublisher
+) -> Generator[TestClient, None, None]:
     def _override_get_db() -> Generator[Session, None, None]:
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_event_publisher] = lambda: fake_publisher
     # Not entered as a context manager: this deliberately skips the app's
-    # lifespan, which runs create_all against DATABASE_URL (the dev DB).
-    # Schema setup for tests is handled by _test_database_schema instead.
+    # lifespan, which runs create_all against DATABASE_URL (the dev DB) and
+    # creates the real Kafka producer. Schema setup for tests is handled by
+    # _test_database_schema, and the publisher is the in-memory fake.
     try:
         yield TestClient(app)
     finally:

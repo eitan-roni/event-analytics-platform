@@ -1,84 +1,49 @@
 from datetime import datetime, timezone
 
-import pytest
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import DuplicateEventError
 from app.models.event import EventORM
 from app.repositories.event_repository import EventRepository
 from app.schemas.event import EventFilters
 
 
-def test_create_persists_event(db_session: Session) -> None:
+def _event(event_id: str = "evt-001", **overrides: object) -> EventORM:
+    fields: dict[str, object] = {
+        "event_id": event_id,
+        "source": "server-01",
+        "event_type": "CPU_SPIKE",
+        "severity": "HIGH",
+        "timestamp": datetime(2026, 9, 9, 12, 30, tzinfo=timezone.utc),
+        "value": 92.5,
+    }
+    fields.update(overrides)
+    return EventORM(**fields)
+
+
+def test_insert_if_absent_persists_event(db_session: Session) -> None:
     repository = EventRepository(db_session)
-    event = EventORM(
-        event_id="evt-001",
-        source="server-01",
-        event_type="CPU_SPIKE",
-        severity="HIGH",
-        timestamp=datetime(2026, 9, 9, 12, 30, tzinfo=timezone.utc),
-        value=92.5,
-    )
 
-    persisted = repository.create(event)
+    assert repository.insert_if_absent(_event()) is True
 
-    assert persisted.id is not None
-    fetched = db_session.get(EventORM, persisted.id)
-    assert fetched is not None
-    assert fetched.event_id == "evt-001"
+    fetched = db_session.query(EventORM).filter_by(event_id="evt-001").one()
+    assert fetched.id is not None
     assert fetched.source == "server-01"
     assert fetched.severity == "HIGH"
     assert fetched.value == 92.5
 
 
-def test_create_duplicate_event_id_raises_and_rolls_back(db_session: Session) -> None:
+def test_insert_if_absent_is_idempotent(db_session: Session) -> None:
     repository = EventRepository(db_session)
-    first = EventORM(
-        event_id="evt-dup",
-        source="server-01",
-        event_type="CPU_SPIKE",
-        severity="HIGH",
-        timestamp=datetime(2026, 9, 9, 12, 30, tzinfo=timezone.utc),
-        value=92.5,
-    )
-    repository.create(first)
+    assert repository.insert_if_absent(_event("evt-dup")) is True
 
-    duplicate = EventORM(
-        event_id="evt-dup",
-        source="server-02",
-        event_type="MEM_SPIKE",
-        severity="LOW",
-        timestamp=datetime(2026, 9, 9, 13, 0, tzinfo=timezone.utc),
-        value=1.0,
-    )
-    with pytest.raises(DuplicateEventError) as exc_info:
-        repository.create(duplicate)
-    assert exc_info.value.event_id == "evt-dup"
+    duplicate = _event("evt-dup", source="server-02", severity="LOW", value=1.0)
+    assert repository.insert_if_absent(duplicate) is False
 
-    # the session is still usable after the repository's own rollback
-    assert db_session.query(EventORM).filter_by(event_id="evt-dup").count() == 1
-
-
-def test_create_non_unique_integrity_error_is_not_swallowed(db_session: Session) -> None:
-    repository = EventRepository(db_session)
-    # Bypasses pydantic validation to trigger a NOT NULL violation directly
-    # against the database — a different IntegrityError than the unique
-    # violation on event_id, which must not be reported as a duplicate.
-    event = EventORM(
-        event_id="evt-not-null",
-        source="server-01",
-        event_type="CPU_SPIKE",
-        severity=None,  # type: ignore[arg-type]
-        timestamp=datetime(2026, 9, 9, 12, 30, tzinfo=timezone.utc),
-        value=92.5,
-    )
-
-    with pytest.raises(IntegrityError):
-        repository.create(event)
-
-    # the session is still usable after the repository's own rollback
-    assert db_session.query(EventORM).filter_by(event_id="evt-not-null").count() == 0
+    rows = db_session.query(EventORM).filter_by(event_id="evt-dup").all()
+    assert len(rows) == 1
+    # the first write wins; the duplicate does not overwrite it
+    assert rows[0].source == "server-01"
+    assert rows[0].value == 92.5
 
 
 def _seed(db_session: Session) -> None:

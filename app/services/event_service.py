@@ -1,7 +1,6 @@
 from app.models.event import EventORM
 from app.repositories.event_repository import EventRepository
 from app.schemas.event import (
-    EventAccepted,
     EventCreate,
     EventFilters,
     EventListResponse,
@@ -14,7 +13,8 @@ class EventService:
     def __init__(self, repository: EventRepository) -> None:
         self._repository = repository
 
-    def ingest(self, event: EventCreate) -> EventAccepted:
+    def store(self, event: EventCreate) -> bool:
+        """Persist an event; returns False if its event_id was already stored."""
         event_orm = EventORM(
             event_id=event.event_id,
             source=event.source,
@@ -23,8 +23,7 @@ class EventService:
             timestamp=event.timestamp,
             value=event.value,
         )
-        persisted = self._repository.create(event_orm)
-        return EventAccepted(event_id=persisted.event_id)
+        return self._repository.insert_if_absent(event_orm)
 
     def list_events(self, filters: EventFilters, limit: int, offset: int) -> EventListResponse:
         items = self._repository.list_events(filters, limit, offset)

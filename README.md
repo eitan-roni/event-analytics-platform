@@ -25,24 +25,85 @@ an API for downstream consumers.
 - **v0.3 — implemented.** Query and stats API (`GET /v1/events`,
   `GET /v1/events/stats`), duplicate `event_id` handling (409 Conflict).
 
-Kafka, Redis, Docker image, and monitoring are not implemented yet. See
+- **v0.4 — implemented.** Kafka ingestion: `POST /v1/events` publishes to a
+  topic and returns `202 Accepted`; a separate consumer persists events.
+
+Redis, Docker image, and monitoring are not implemented yet. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
+
+## Architecture
+
+```
+client -> API (POST /v1/events) -> Kafka topic "events" -> consumer -> PostgreSQL
+                                                                        ^
+client -> API (GET /v1/events, GET /v1/events/stats) -------------------+
+```
+
+- The API validates the event (422 on invalid input) and publishes it as
+  JSON to the `events` topic, keyed by `source` (so events from one source
+  keep their order within a partition). It waits for the broker's
+  acknowledgement (`acks=all`, idempotent producer) and returns `202
+  Accepted`, or `503` if the event could not be published in time. The API
+  does not write to the database.
+- The consumer (`python -m app.consumer`) reads the topic as consumer group
+  `KAFKA_CONSUMER_GROUP` and inserts each event with
+  `ON CONFLICT (event_id) DO NOTHING`. It commits the Kafka offset only after
+  the database transaction is committed, so delivery is at-least-once and
+  redelivered messages are harmless.
+  - Malformed or invalid messages are logged and skipped.
+  - On a database error the consumer exits non-zero without committing the
+    offset; the message is redelivered when it restarts.
+  - It stops cleanly on Ctrl+C / SIGTERM.
+- Because persistence is asynchronous, a `202` means "queued", not
+  "stored": the event shows up in the GET endpoints once the consumer has
+  processed it. A duplicate `event_id` is accepted by the API and silently
+  ignored by the consumer (the 409 response from v0.3 is gone).
 
 ## Project Structure
 
 ```
-app/     - application source code
-tests/   - test suite
+app/            - application source code
+  api/          - FastAPI routes
+  services/     - business logic
+  repositories/ - database access
+  messaging/    - Kafka publisher
+  consumer/     - Kafka consumer entry point (python -m app.consumer)
+tests/          - test suite
 ```
 
 ## Run
 
-Set `DATABASE_URL` (defaults to
-`postgresql+psycopg://postgres:postgres@localhost:5432/event_analytics`) and
-start the API:
+Start PostgreSQL and a single-node Kafka broker (KRaft mode, no ZooKeeper,
+reachable at `localhost:9092`):
+
+```
+docker compose up -d
+```
+
+The one-shot `kafka-init` service creates the `events` topic with 3
+partitions (topic auto-creation is disabled on the broker). The broker has no
+volume, so its data is discarded by `docker compose down`; the topic is
+recreated on the next `up`.
+
+Configuration (environment variables, see `.env.example`):
+
+| Variable                  | Default                                                               |
+|---------------------------|-----------------------------------------------------------------------|
+| `DATABASE_URL`            | `postgresql+psycopg://postgres:postgres@localhost:5432/event_analytics` |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092`                                                      |
+| `KAFKA_EVENTS_TOPIC`      | `events`                                                              |
+| `KAFKA_CONSUMER_GROUP`    | `event-consumer`                                                      |
+
+Start the API:
 
 ```
 uvicorn app.main:app --reload
+```
+
+Start the consumer in a second terminal:
+
+```
+python -m app.consumer
 ```
 
 The app creates the `events` table on startup if it doesn't exist yet
@@ -60,7 +121,19 @@ pytest
 ```
 
 The test suite creates and drops the schema around the whole run, so it
-always tests against the current models.
+always tests against the current models. The default run needs only
+PostgreSQL: the API tests replace the Kafka publisher with an in-memory fake,
+and the consumer's message handling is tested without a broker.
+
+### Integration test (Kafka)
+
+One end-to-end test (POST -> Kafka -> consumer logic -> row in PostgreSQL) is
+marked `integration` and excluded from the default run. With
+`docker compose up -d` running:
+
+```
+pytest -m integration
+```
 
 ### Recreating the dev database after an index/schema change
 

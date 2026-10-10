@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+confluent-kafka
 sqlalchemy
 psycopg[binary]
 pytest
