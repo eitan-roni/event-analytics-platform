@@ -27,7 +27,7 @@ class EventService:
         return EventAccepted(event_id=persisted.event_id)
 
     def list_events(self, filters: EventFilters, limit: int, offset: int) -> EventListResponse:
-        items = self._repository.list(filters, limit, offset)
+        items = self._repository.list_events(filters, limit, offset)
         total = self._repository.count(filters)
         return EventListResponse(
             items=[EventRead.model_validate(item) for item in items],

@@ -168,6 +168,36 @@ class TestListEvents:
         assert body["total"] == 4
         assert [item["event_id"] for item in body["items"]] == ["evt-3", "evt-2"]
 
+    def test_pagination_is_deterministic_with_tied_timestamps(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        tied_timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        db_session.add_all(
+            EventORM(
+                event_id=f"tied-{i}",
+                source="server-01",
+                event_type="CPU_SPIKE",
+                severity="LOW",
+                timestamp=tied_timestamp,
+                value=float(i),
+            )
+            for i in range(5)
+        )
+        db_session.commit()
+
+        seen: list[str] = []
+        for offset in range(5):
+            response = client.get("/v1/events", params={"limit": 1, "offset": offset})
+            assert response.status_code == 200
+            items = response.json()["items"]
+            assert len(items) == 1
+            seen.append(items[0]["event_id"])
+
+        # every event appears exactly once across the pages — no repeats,
+        # no gaps — even though they all share one timestamp.
+        assert sorted(seen) == sorted(f"tied-{i}" for i in range(5))
+        assert len(set(seen)) == 5
+
     def test_limit_bounds_are_accepted(
         self, client: TestClient, db_session: Session
     ) -> None:

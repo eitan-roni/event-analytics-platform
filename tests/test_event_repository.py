@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import DuplicateEventError
@@ -59,6 +60,27 @@ def test_create_duplicate_event_id_raises_and_rolls_back(db_session: Session) ->
     assert db_session.query(EventORM).filter_by(event_id="evt-dup").count() == 1
 
 
+def test_create_non_unique_integrity_error_is_not_swallowed(db_session: Session) -> None:
+    repository = EventRepository(db_session)
+    # Bypasses pydantic validation to trigger a NOT NULL violation directly
+    # against the database — a different IntegrityError than the unique
+    # violation on event_id, which must not be reported as a duplicate.
+    event = EventORM(
+        event_id="evt-not-null",
+        source="server-01",
+        event_type="CPU_SPIKE",
+        severity=None,  # type: ignore[arg-type]
+        timestamp=datetime(2026, 9, 9, 12, 30, tzinfo=timezone.utc),
+        value=92.5,
+    )
+
+    with pytest.raises(IntegrityError):
+        repository.create(event)
+
+    # the session is still usable after the repository's own rollback
+    assert db_session.query(EventORM).filter_by(event_id="evt-not-null").count() == 0
+
+
 def _seed(db_session: Session) -> None:
     db_session.add_all(
         [
@@ -87,7 +109,7 @@ def test_list_orders_by_timestamp_descending(db_session: Session) -> None:
     _seed(db_session)
     repository = EventRepository(db_session)
 
-    results = repository.list(EventFilters(), limit=50, offset=0)
+    results = repository.list_events(EventFilters(), limit=50, offset=0)
 
     assert [event.event_id for event in results] == ["evt-2", "evt-1"]
 
@@ -96,7 +118,7 @@ def test_list_applies_pagination(db_session: Session) -> None:
     _seed(db_session)
     repository = EventRepository(db_session)
 
-    results = repository.list(EventFilters(), limit=1, offset=1)
+    results = repository.list_events(EventFilters(), limit=1, offset=1)
 
     assert [event.event_id for event in results] == ["evt-1"]
 

@@ -1,3 +1,4 @@
+from psycopg.errors import UniqueViolation
 from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -17,13 +18,16 @@ class EventRepository:
             self._db.commit()
         except IntegrityError as exc:
             self._db.rollback()
-            raise DuplicateEventError(event.event_id) from exc
+            if isinstance(exc.orig, UniqueViolation):
+                raise DuplicateEventError(event.event_id) from exc
+            raise
         self._db.refresh(event)
         return event
 
-    def list(self, filters: EventFilters, limit: int, offset: int) -> list[EventORM]:
+    def list_events(self, filters: EventFilters, limit: int, offset: int) -> list[EventORM]:
         stmt = self._apply_filters(select(EventORM), filters)
-        stmt = stmt.order_by(EventORM.timestamp.desc()).limit(limit).offset(offset)
+        stmt = stmt.order_by(EventORM.timestamp.desc(), EventORM.id.desc())
+        stmt = stmt.limit(limit).offset(offset)
         return list(self._db.scalars(stmt).all())
 
     def count(self, filters: EventFilters) -> int:
