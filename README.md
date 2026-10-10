@@ -18,8 +18,13 @@ an API for downstream consumers.
 
 ## Status
 
-Early scaffolding stage. Application logic, infrastructure, and the above
-stack components have not been implemented yet.
+- **v0.1 — implemented.** Event ingestion API (`POST /v1/events`, validation,
+  health check).
+- **v0.2 — implemented.** PostgreSQL persistence (SQLAlchemy, service and
+  repository layers, separate test database).
+
+Kafka, Redis, Docker image, and monitoring are not implemented yet. See
+[docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 
 ## Project Structure
 
