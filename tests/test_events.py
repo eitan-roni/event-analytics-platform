@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.models.event import EventORM
-from tests.conftest import InMemoryEventPublisher
+from tests.conftest import InMemoryCache, InMemoryEventPublisher
 
 VALID_PAYLOAD = {
     "event_id": "evt-123",
@@ -274,6 +274,60 @@ class TestListEvents:
 
 
 class TestEventStats:
+    def test_second_identical_call_is_served_from_cache(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        _seed_events(db_session)
+        first = client.get("/v1/events/stats", params={"source": "server-01"})
+        assert first.status_code == 200
+        assert first.headers["X-Cache"] == "MISS"
+        assert first.json()["total"] == 2
+
+        # A new row is not visible until the entry expires: the second
+        # response comes from the cache, not the database.
+        db_session.add(
+            EventORM(
+                event_id="evt-5",
+                source="server-01",
+                event_type="CPU_SPIKE",
+                severity="LOW",
+                timestamp=datetime(2026, 1, 5, tzinfo=timezone.utc),
+                value=50.0,
+            )
+        )
+        db_session.commit()
+
+        second = client.get("/v1/events/stats", params={"source": "server-01"})
+        assert second.status_code == 200
+        assert second.headers["X-Cache"] == "HIT"
+        assert second.json() == first.json()
+
+    def test_different_filters_are_cached_separately(
+        self, client: TestClient, db_session: Session
+    ) -> None:
+        _seed_events(db_session)
+        assert client.get("/v1/events/stats").headers["X-Cache"] == "MISS"
+        filtered = client.get("/v1/events/stats", params={"source": "server-02"})
+        assert filtered.headers["X-Cache"] == "MISS"
+        assert filtered.json()["total"] == 2
+
+    @pytest.mark.parametrize("failure", ["fail_get", "fail_set"])
+    def test_cache_failure_falls_back_to_database(
+        self,
+        client: TestClient,
+        db_session: Session,
+        fake_cache: InMemoryCache,
+        failure: str,
+    ) -> None:
+        _seed_events(db_session)
+        setattr(fake_cache, failure, True)
+
+        response = client.get("/v1/events/stats")
+
+        assert response.status_code == 200
+        assert response.headers["X-Cache"] == "MISS"
+        assert response.json()["total"] == 4
+
     def test_empty_table(self, client: TestClient) -> None:
         response = client.get("/v1/events/stats")
         assert response.status_code == 200

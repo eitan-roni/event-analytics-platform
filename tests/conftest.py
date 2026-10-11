@@ -6,9 +6,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.api.events import get_event_publisher
+from app.api.events import get_event_publisher, get_stats_cache
 from app.core.config import DATABASE_URL, TEST_DATABASE_URL
-from app.core.exceptions import PublishError
+from app.core.exceptions import CacheError, PublishError
 from app.db.base import Base
 from app.db.session import get_db
 from app.main import app
@@ -29,6 +29,42 @@ class InMemoryEventPublisher:
 
     def close(self) -> None:
         pass
+
+
+class InMemoryCache:
+    """Cache fake with TTL expiry against a fake clock.
+
+    Advance ``now`` (seconds) to simulate time passing instead of sleeping.
+    """
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self._entries: dict[str, tuple[str, float]] = {}
+        self.set_calls: list[tuple[str, str, int]] = []
+        self.fail_get = False
+        self.fail_set = False
+
+    def get(self, key: str) -> str | None:
+        if self.fail_get:
+            raise CacheError("simulated cache read failure")
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if self.now >= expires_at:
+            del self._entries[key]
+            return None
+        return value
+
+    def set(self, key: str, value: str, ttl_seconds: int) -> None:
+        if self.fail_set:
+            raise CacheError("simulated cache write failure")
+        self.set_calls.append((key, value, ttl_seconds))
+        self._entries[key] = (value, self.now + ttl_seconds)
+
+    def put_raw(self, key: str, value: str) -> None:
+        """Store a value directly (e.g. a corrupt entry), without expiry."""
+        self._entries[key] = (value, float("inf"))
 
 
 class InMemoryDeadLetterPublisher:
@@ -114,18 +150,24 @@ def fake_publisher() -> InMemoryEventPublisher:
 
 
 @pytest.fixture
+def fake_cache() -> InMemoryCache:
+    return InMemoryCache()
+
+
+@pytest.fixture
 def client(
-    db_session: Session, fake_publisher: InMemoryEventPublisher
+    db_session: Session, fake_publisher: InMemoryEventPublisher, fake_cache: InMemoryCache
 ) -> Generator[TestClient, None, None]:
     def _override_get_db() -> Generator[Session, None, None]:
         yield db_session
 
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_event_publisher] = lambda: fake_publisher
+    app.dependency_overrides[get_stats_cache] = lambda: fake_cache
     # Not entered as a context manager: this deliberately skips the app's
     # lifespan, which runs create_all against DATABASE_URL (the dev DB) and
-    # creates the real Kafka producer. Schema setup for tests is handled by
-    # _test_database_schema, and the publisher is the in-memory fake.
+    # creates the real Kafka producer and Redis client. Schema setup for tests
+    # is handled by _test_database_schema; publisher and cache are fakes.
     try:
         yield TestClient(app)
     finally:

@@ -17,3 +17,9 @@ KAFKA_EVENTS_TOPIC = os.getenv("KAFKA_EVENTS_TOPIC", "events")
 KAFKA_CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "event-consumer")
 
 KAFKA_DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "events.dlq")
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+STATS_CACHE_TTL_SECONDS = int(os.getenv("STATS_CACHE_TTL_SECONDS", "30"))
+if STATS_CACHE_TTL_SECONDS < 1:
+    raise ValueError("STATS_CACHE_TTL_SECONDS must be at least 1")

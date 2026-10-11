@@ -28,8 +28,10 @@ an API for downstream consumers.
   topic and returns `202 Accepted`; a separate consumer persists events.
 - **v0.5 — implemented.** Dead-letter topic: messages the consumer cannot
   process are preserved on `events.dlq` instead of being dropped.
+- **v0.6 — implemented.** Redis cache for `GET /v1/events/stats` (TTL
+  expiry, fail-open).
 
-Redis, Docker image, and monitoring are not implemented yet. See
+Docker image, migrations, and monitoring are not implemented yet. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 
 ## Architecture
@@ -40,7 +42,9 @@ client -> API (POST /v1/events) -> Kafka topic "events" -> consumer -> PostgreSQ
                                        rejected messages      v          |
                                              Kafka topic "events.dlq"    |
                                                                          |
-client -> API (GET /v1/events, GET /v1/events/stats) --------------------+
+client -> API (GET /v1/events) ------------------------------------------+
+                                                                         |
+client -> API (GET /v1/events/stats) -> Redis cache --- on miss ---------+
 ```
 
 - The API validates the event and publishes it as JSON to the `events`
@@ -107,6 +111,30 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh   --bootstrap
 In Git Bash on Windows, prefix the command with `MSYS_NO_PATHCONV=1` so the
 container path isn't rewritten into a Windows path.
 
+### Stats cache
+
+`GET /v1/events/stats` is cached in Redis; `GET /v1/events` is not.
+
+- **Key:** `stats:v1:` followed by a SHA-256 of the normalized filters
+  (unset filters omitted, timezone-aware times converted to UTC), so
+  equivalent filters, such as the same instant written with different UTC
+  offsets, share one entry. The value is the response JSON. Bump the `v1`
+  prefix when the response format changes, so old entries are ignored.
+- **Expiry:** by TTL only (`STATS_CACHE_TTL_SECONDS`, default 30). Nothing is
+  invalidated when events are written, so stats can be up to one TTL stale.
+  That is acceptable because ingestion is asynchronous anyway: a new event
+  is not counted until the consumer has stored it.
+- **Fail-open:** if Redis is unreachable, slow, or returns an error (or holds
+  an unreadable entry), a warning is logged and the stats are computed from
+  PostgreSQL. Redis never turns a working request into an error. Connect and
+  read timeouts are 0.2 s and client retries are disabled, so a request
+  waits at most about 0.2 s per cache operation (one read, and one write on
+  a miss) when Redis is down or hung, until it recovers. During an outage
+  every stats request logs a warning.
+- **Observability:** the response carries `X-Cache: HIT` (served from Redis)
+  or `X-Cache: MISS` (computed from PostgreSQL, including when Redis is
+  unavailable).
+
 ## Project Structure
 
 ```
@@ -114,14 +142,16 @@ app/            - application source code
   api/          - FastAPI routes
   services/     - business logic
   repositories/ - database access
-  messaging/    - Kafka publisher
+  messaging/    - Kafka publishers (events, dead letters)
+  cache/        - Redis cache
   consumer/     - Kafka consumer entry point (python -m app.consumer)
 tests/          - test suite
 ```
 
 ## Run
 
-Start PostgreSQL and a single-node Kafka broker (KRaft mode, no ZooKeeper,
+Start PostgreSQL, Redis (`localhost:6379`, no persistence: it only holds
+the cache) and a single-node Kafka broker (KRaft mode, no ZooKeeper,
 reachable at `localhost:9092`):
 
 ```
@@ -143,6 +173,8 @@ Configuration (environment variables, see `.env.example`):
 | `KAFKA_EVENTS_TOPIC`      | `events`                                                                |
 | `KAFKA_DLQ_TOPIC`         | `events.dlq`                                                            |
 | `KAFKA_CONSUMER_GROUP`    | `event-consumer`                                                        |
+| `REDIS_URL`               | `redis://localhost:6379/0`                                              |
+| `STATS_CACHE_TTL_SECONDS` | `30` (must be at least 1)                                               |
 
 Start the API:
 
@@ -175,12 +207,19 @@ always tests against the current models. The default run needs only
 PostgreSQL: the API tests replace the Kafka publisher with an in-memory fake,
 and the consumer's message handling is tested without a broker.
 
-### Integration tests (Kafka)
+### Integration tests (Kafka, Redis)
 
-Two end-to-end tests are marked `integration` and excluded from the default
-run: POST -> Kafka -> consumer logic -> row in PostgreSQL, and an invalid
-message on `events` -> consumer logic -> `events.dlq` with its headers. With
-`docker compose up -d` running:
+Three tests are marked `integration` and excluded from the default run (the
+default run uses in-memory fakes for Kafka and the cache, so it needs only
+PostgreSQL):
+
+- POST -> Kafka -> consumer logic -> row in PostgreSQL
+- an invalid message on `events` -> consumer logic -> `events.dlq` with its
+  headers
+- the stats endpoint against the real Redis: MISS, then HIT, and the key's
+  TTL is set
+
+With `docker compose up -d` running:
 
 ```
 pytest -m integration

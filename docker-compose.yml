@@ -16,6 +16,18 @@ services:
       timeout: 5s
       retries: 5
 
+  # Cache only: persistence is disabled, so no volume.
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   # Single-node Kafka in KRaft mode (combined broker + controller, no ZooKeeper).
   # PLAINTEXT is advertised as localhost:9092 for clients on the host;
   # INTERNAL is used by other containers on the compose network.

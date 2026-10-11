@@ -8,9 +8,9 @@
 - v0.4 - Kafka ingestion: the API publishes to a topic, a separate
   consumer persists events
 - v0.5 - Dead-letter topic for unprocessable messages
+- v0.6 - Redis cache for the stats endpoint (TTL expiry, fail-open)
 
 ## Planned
-- v0.6 - Redis: caching of aggregates, duplicate detection
 - v0.7 - App Dockerfile, Alembic migrations, Prometheus metrics
 
 ## Working agreement

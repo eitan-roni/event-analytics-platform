@@ -1,8 +1,10 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
+from app.cache.cache import Cache
+from app.core.config import STATS_CACHE_TTL_SECONDS
 from app.core.exceptions import PublishError
 from app.db.session import get_db
 from app.messaging.publisher import EventPublisher
@@ -23,6 +25,10 @@ router = APIRouter(prefix="/v1", tags=["events"])
 
 def get_event_publisher(request: Request) -> EventPublisher:
     return request.app.state.event_publisher
+
+
+def get_stats_cache(request: Request) -> Cache:
+    return request.app.state.stats_cache
 
 
 def get_event_filters(
@@ -68,8 +74,14 @@ def list_events(
 
 @router.get("/events/stats", response_model=EventStats)
 def get_event_stats(
+    response: Response,
     filters: EventFilters = Depends(get_event_filters),
     db: Session = Depends(get_db),
+    cache: Cache = Depends(get_stats_cache),
 ) -> EventStats:
-    service = EventService(EventRepository(db))
-    return service.get_stats(filters)
+    service = EventService(
+        EventRepository(db), stats_cache=cache, stats_cache_ttl_seconds=STATS_CACHE_TTL_SECONDS
+    )
+    result = service.get_stats(filters)
+    response.headers["X-Cache"] = "HIT" if result.cache_hit else "MISS"
+    return result.stats
