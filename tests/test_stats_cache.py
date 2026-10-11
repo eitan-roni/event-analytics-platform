@@ -9,6 +9,7 @@ from app.repositories.event_repository import EventRepository
 from app.schemas.event import EventFilters
 from app.services.event_service import (
     STATS_CACHE_KEY_PREFIX,
+    CacheStatus,
     EventService,
     stats_cache_key,
 )
@@ -59,8 +60,8 @@ def test_first_call_misses_and_second_call_hits(
     first = service.get_stats(EventFilters())
     second = service.get_stats(EventFilters())
 
-    assert first.cache_hit is False
-    assert second.cache_hit is True
+    assert first.cache_status is CacheStatus.MISS
+    assert second.cache_status is CacheStatus.HIT
     assert second.stats == first.stats
     assert first.stats.total == 2
     repository.get_stats.assert_called_once()
@@ -158,9 +159,11 @@ def test_cache_read_failure_falls_back_to_database(
 
     result = service.get_stats(EventFilters())
 
-    assert result.cache_hit is False
+    assert result.cache_status is CacheStatus.ERROR
     assert result.stats.total == 2
     repository.get_stats.assert_called_once()
+    # an unreachable cache is not written to either
+    assert fake_cache.set_calls == []
 
 
 def test_cache_write_failure_still_returns_stats(
@@ -170,7 +173,8 @@ def test_cache_write_failure_still_returns_stats(
 
     result = service.get_stats(EventFilters())
 
-    assert result.cache_hit is False
+    # the lookup itself was a plain miss; only the write failed
+    assert result.cache_status is CacheStatus.MISS
     assert result.stats.total == 2
     repository.get_stats.assert_called_once()
 
@@ -182,7 +186,9 @@ def test_corrupt_cache_entry_falls_back_to_database(
 
     result = service.get_stats(EventFilters())
 
-    assert result.cache_hit is False
+    assert result.cache_status is CacheStatus.ERROR
+    # Redis itself works, so the unreadable entry is overwritten
+    assert [key for key, _, _ in fake_cache.set_calls] == [stats_cache_key(EventFilters())]
     assert result.stats.total == 2
     repository.get_stats.assert_called_once()
 

@@ -1,11 +1,13 @@
 import logging
 import signal
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from types import FrameType
 from typing import Protocol
 
-from confluent_kafka import Consumer, KafkaException, Message
+from confluent_kafka import Consumer, KafkaException, Message, TopicPartition
+from prometheus_client import start_http_server
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -15,7 +17,15 @@ from app.consumer.handler import (
     RejectionCategory,
     handle_message,
 )
+from app.consumer.metrics import (
+    MESSAGE_PROCESSING_DURATION,
+    MESSAGES_DEAD_LETTERED,
+    MESSAGES_PROCESSED,
+    forget_partitions,
+    update_consumer_lag,
+)
 from app.core.config import (
+    CONSUMER_METRICS_PORT,
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_CONSUMER_GROUP,
     KAFKA_DLQ_TOPIC,
@@ -30,6 +40,7 @@ from app.services.event_service import EventService
 logger = logging.getLogger(__name__)
 
 POLL_TIMEOUT_SECONDS = 1.0
+LAG_UPDATE_INTERVAL_SECONDS = 5.0
 MAX_ERROR_DETAIL_LENGTH = 1000
 
 
@@ -75,6 +86,7 @@ def process_message(
     database error such as OperationalError) leave the offset uncommitted, so
     the message will be redelivered.
     """
+    start = time.perf_counter()
     location = f"{message.topic()}[{message.partition()}]@{message.offset()}"
     with session_factory() as session:
         result = handle_message(message.value(), EventService(EventRepository(session)))
@@ -101,6 +113,7 @@ def process_message(
                 result.rejection, message.topic(), message.partition(), message.offset()
             ),
         )
+        MESSAGES_DEAD_LETTERED.labels(result.rejection.category.value).inc()
     elif result.outcome is MessageOutcome.DUPLICATE:
         logger.info("Message %s is a duplicate of a stored event; ignoring", location)
 
@@ -111,6 +124,11 @@ def process_message(
             raise
         # The message will be redelivered; the insert is idempotent.
         logger.warning("Failed to commit offset for %s: %s", location, exc)
+
+    # Only messages processed to completion are counted; a message whose
+    # processing raised will be redelivered and counted then.
+    MESSAGES_PROCESSED.labels(result.outcome.value).inc()
+    MESSAGE_PROCESSING_DURATION.observe(time.perf_counter() - start)
     return result.outcome
 
 
@@ -127,7 +145,11 @@ def main() -> int:
             "auto.offset.reset": "earliest",
         }
     )
-    consumer.subscribe([KAFKA_EVENTS_TOPIC])
+    def on_revoke(_consumer: Consumer, partitions: list[TopicPartition]) -> None:
+        forget_partitions(partitions)
+
+    consumer.subscribe([KAFKA_EVENTS_TOPIC], on_revoke=on_revoke)
+    start_http_server(CONSUMER_METRICS_PORT)
     dead_letter_publisher = KafkaDeadLetterPublisher(KAFKA_BOOTSTRAP_SERVERS, KAFKA_DLQ_TOPIC)
 
     running = True
@@ -141,15 +163,21 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
 
     logger.info(
-        "Consuming topic %r as group %r from %s; dead-letter topic %r",
+        "Consuming topic %r as group %r from %s; dead-letter topic %r; "
+        "metrics on port %s",
         KAFKA_EVENTS_TOPIC,
         KAFKA_CONSUMER_GROUP,
         KAFKA_BOOTSTRAP_SERVERS,
         KAFKA_DLQ_TOPIC,
+        CONSUMER_METRICS_PORT,
     )
+    next_lag_update = 0.0
     try:
         while running:
             message = consumer.poll(POLL_TIMEOUT_SECONDS)
+            if time.monotonic() >= next_lag_update:
+                update_consumer_lag(consumer)
+                next_lag_update = time.monotonic() + LAG_UPDATE_INTERVAL_SECONDS
             if message is None:
                 continue
             error = message.error()

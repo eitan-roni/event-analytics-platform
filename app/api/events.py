@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.orm import Session
 
+from app.api.metrics import EVENTS_PUBLISHED, STATS_CACHE_LOOKUPS
 from app.cache.cache import Cache
 from app.core.config import STATS_CACHE_TTL_SECONDS
 from app.core.exceptions import PublishError
@@ -53,12 +54,15 @@ def create_event(
 ) -> EventAccepted:
     service = EventIngestionService(publisher)
     try:
-        return service.ingest(event)
+        accepted = service.ingest(event)
     except PublishError as exc:
+        EVENTS_PUBLISHED.labels("error").inc()
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Event could not be queued for processing; retry later",
         ) from exc
+    EVENTS_PUBLISHED.labels("ok").inc()
+    return accepted
 
 
 @router.get("/events", response_model=EventListResponse)
@@ -83,5 +87,6 @@ def get_event_stats(
         EventRepository(db), stats_cache=cache, stats_cache_ttl_seconds=STATS_CACHE_TTL_SECONDS
     )
     result = service.get_stats(filters)
+    STATS_CACHE_LOOKUPS.labels(result.cache_status.value).inc()
     response.headers["X-Cache"] = "HIT" if result.cache_hit else "MISS"
     return result.stats

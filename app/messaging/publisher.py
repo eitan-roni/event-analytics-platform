@@ -8,6 +8,7 @@ from app.core.exceptions import PublishError
 
 DEFAULT_PUBLISH_TIMEOUT_SECONDS = 5.0
 DEFAULT_FLUSH_TIMEOUT_SECONDS = 10.0
+DEFAULT_CHECK_TIMEOUT_SECONDS = 2.0
 
 
 class EventPublisher(Protocol):
@@ -81,6 +82,15 @@ class KafkaProducerClient:
     def flush(self) -> None:
         self._producer.flush(DEFAULT_FLUSH_TIMEOUT_SECONDS)
 
+    def check_topic(self, topic: str, timeout_seconds: float) -> None:
+        """Raise if the broker is unreachable or the topic does not exist."""
+        metadata = self._producer.list_topics(topic, timeout=timeout_seconds)
+        topic_metadata = metadata.topics.get(topic)
+        if topic_metadata is None:
+            raise KafkaException(f"Topic {topic!r} not found")
+        if topic_metadata.error is not None:
+            raise KafkaException(topic_metadata.error)
+
 
 class KafkaEventPublisher:
     """Publishes events to a Kafka topic with one long-lived Producer."""
@@ -96,6 +106,10 @@ class KafkaEventPublisher:
 
     def publish(self, key: str, value: bytes) -> None:
         self._producer.send(self._topic, key=key.encode("utf-8"), value=value)
+
+    def check_connection(self, timeout_seconds: float = DEFAULT_CHECK_TIMEOUT_SECONDS) -> None:
+        """Readiness probe: raise if the events topic cannot be reached."""
+        self._producer.check_topic(self._topic, timeout_seconds)
 
     def close(self) -> None:
         self._producer.flush()

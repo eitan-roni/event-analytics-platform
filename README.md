@@ -32,9 +32,10 @@ an API for downstream consumers.
   expiry, fail-open).
 - **v0.7 — implemented.** One Docker image for the API and the consumer,
   Alembic migrations, pinned dependencies.
+- **v0.8 — implemented.** Prometheus metrics for the API and the consumer,
+  `/ready` readiness checks, Prometheus server in compose.
 
-Metrics and readiness checks are not implemented yet. See
-[docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the roadmap.
 
 ## Architecture
 
@@ -128,11 +129,16 @@ container path isn't rewritten into a Windows path.
   is not counted until the consumer has stored it.
 - **Fail-open:** if Redis is unreachable, slow, or returns an error (or holds
   an unreadable entry), a warning is logged and the stats are computed from
-  PostgreSQL. Redis never turns a working request into an error. Connect and
-  read timeouts are 0.2 s and client retries are disabled, so a request
-  waits at most about 0.2 s per cache operation (one read, and one write on
-  a miss) when Redis is down or hung, until it recovers. During an outage
-  every stats request logs a warning.
+  PostgreSQL. Redis never turns a working request into an error.
+  - Connect and read timeouts are 0.2 s and client retries are disabled.
+  - If the cache read fails, the write is skipped, so a request makes at
+    most one failing cache call.
+  - After a failed cache call, Redis is skipped for 10 s and requests go
+    straight to PostgreSQL. Some failures take much longer than the socket
+    timeouts: in compose, once the `redis` container is stopped, resolving
+    the name `redis` takes about 8 s. During an outage, at most one request
+    per 10 s window pays that cost; the rest are unaffected.
+  - During an outage every stats request logs a warning.
 - **Observability:** the response carries `X-Cache: HIT` (served from Redis)
   or `X-Cache: MISS` (computed from PostgreSQL, including when Redis is
   unavailable).
@@ -149,7 +155,7 @@ app/                 - application source code
   consumer/          - Kafka consumer entry point (python -m app.consumer)
 migrations/          - Alembic migrations (alembic.ini at the root)
 tests/               - test suite
-docker/              - Postgres init script (creates the test database)
+docker/              - Postgres init script (test database), Prometheus config
 Dockerfile           - one image for the API, the consumer and migrations
 requirements.txt     - pinned runtime dependencies (installed in the image)
 requirements-dev.txt - runtime + test dependencies
@@ -199,6 +205,7 @@ point at the compose infrastructure on `localhost`):
 | `KAFKA_CONSUMER_GROUP`    | `event-consumer`                                                        |
 | `REDIS_URL`               | `redis://localhost:6379/0`                                              |
 | `STATS_CACHE_TTL_SECONDS` | `30` (must be at least 1)                                               |
+| `CONSUMER_METRICS_PORT`   | `9101` (the consumer's Prometheus endpoint)                             |
 
 ### Option B: everything in compose
 
@@ -215,12 +222,89 @@ services from it, configured to use the compose network names (`postgres`,
 - `api` serves on `http://localhost:8000` (the same port as a local uvicorn,
   so stop one before starting the other);
 - `consumer` runs `python -m app.consumer` and is restarted by compose when
-  it exits with an error (database or dead-letter failure).
+  it exits with an error (database or dead-letter failure);
+- `prometheus` (`prom/prometheus`, not built from the image) scrapes both
+  every 15 s and serves its UI on `http://localhost:9090`.
 
 `api` and `consumer` start only after the infrastructure is healthy, the
-topics exist and `migrate` has completed successfully. Follow the logs with
+topics exist and `migrate` has completed successfully. The `api` container
+has a healthcheck on `/health`. Follow the logs with
 `docker compose --profile app logs -f api consumer`; stop everything with
 `docker compose --profile app down`.
+
+## Operations
+
+### Health and readiness
+
+- **`GET /health`** is a liveness check: it returns `{"status": "ok"}` as
+  long as the process serves requests, and calls no dependencies. Use it to
+  decide whether to **restart** the process (the compose healthcheck uses
+  it).
+- **`GET /ready`** is a readiness check: it probes the dependencies in
+  parallel and returns `200` when the API can do its job, `503` when it
+  cannot. Use it to decide whether to **send traffic** to the process.
+  PostgreSQL and Kafka are critical (503 if either is down); Redis is
+  reported but not critical, because the stats cache fails open.
+
+  ```
+  {"status": "ready",
+   "checks": {"postgres": {"status": "up", "critical": true},
+              "kafka":    {"status": "up", "critical": true},
+              "redis":    {"status": "down", "critical": false,
+                           "error": "CacheError: Cache ping failed: ..."}}}
+  ```
+
+  Each probe has a short timeout: PostgreSQL connect 2 s, Kafka metadata
+  2 s for the events topic (a missing topic counts as down), Redis 0.2 s.
+  The whole check is capped at 3 s; a probe still running then is reported
+  as down with `timed out after 3.0s`.
+
+### Metrics
+
+The API serves Prometheus metrics on `GET /metrics`; the consumer on
+`http://<host>:CONSUMER_METRICS_PORT/metrics` (default port 9101). Labels are
+kept low-cardinality: the route label is the route template (for example
+`/v1/events`), with `<unmatched>` for requests that match no route, and no
+label ever carries an event ID, source or other user input.
+
+API:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `http_requests_total` | counter | `method`, `route`, `status` | Requests handled. `/metrics`, `/health` and `/ready` are not counted. |
+| `http_request_duration_seconds` | histogram | `method`, `route`, `status` | Request duration (same exclusions). |
+| `events_published_total` | counter | `result` (`ok`, `error`) | Events published to Kafka by `POST /v1/events`; `error` means the client got 503. |
+| `stats_cache_lookups_total` | counter | `result` (`hit`, `miss`, `error`) | Stats cache lookups; `error` means Redis failed or held an unreadable entry. |
+
+Consumer:
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `consumer_messages_processed_total` | counter | `outcome` (`stored`, `duplicate`, `rejected`) | Messages processed to completion (offset committed). |
+| `consumer_messages_dead_lettered_total` | counter | `category` (`invalid_payload`, `database_rejected`) | Messages forwarded to the dead-letter topic. |
+| `consumer_message_processing_seconds` | histogram | | Time to process one message, including dead-lettering and the commit. |
+| `consumer_lag_messages` | gauge | `topic`, `partition` | Messages between the consumer's position and the end of each assigned partition, refreshed every 5 s. |
+
+A message whose processing fails (database connection error, failed
+dead-letter publish) is not counted; it is redelivered and counted then.
+
+The API metrics live in the process's memory and **assume a single uvicorn
+worker** (the default). With several workers each one keeps its own counters
+and Prometheus would see whichever worker answered the scrape; that setup
+would need prometheus-client's multiprocess mode.
+
+### Prometheus
+
+With `docker compose --profile app up -d` running, open
+`http://localhost:9090`. Under *Status → Targets* both `api` and `consumer`
+should be up. Useful queries:
+
+- Request rate per route:
+  `sum by (route) (rate(http_requests_total[5m]))`
+- Share of requests answered with a server error (0 when there are none):
+  `(sum(rate(http_requests_total{status=~"5.."}[5m])) or vector(0)) / sum(rate(http_requests_total[5m]))`
+- Consumer lag per partition:
+  `sum by (partition) (consumer_lag_messages)`
 
 ## Database migrations
 
@@ -289,13 +373,14 @@ broker.
 
 ### Integration tests (Kafka, Redis)
 
-Three tests are marked `integration` and excluded from the default run:
+Four tests are marked `integration` and excluded from the default run:
 
 - POST -> Kafka -> consumer logic -> row in PostgreSQL
 - an invalid message on `events` -> consumer logic -> `events.dlq` with its
   headers
 - the stats endpoint against the real Redis: MISS, then HIT, and the key's
   TTL is set
+- `/ready` with the real PostgreSQL, Kafka and Redis probes
 
 With `docker compose up -d` running:
 

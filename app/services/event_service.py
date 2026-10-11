@@ -3,6 +3,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 
 from pydantic import ValidationError
 
@@ -24,10 +25,21 @@ logger = logging.getLogger(__name__)
 STATS_CACHE_KEY_PREFIX = "stats:v1:"
 
 
+class CacheStatus(str, Enum):
+    HIT = "hit"
+    MISS = "miss"
+    # the cache could not be read, or held an unreadable entry
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class StatsResult:
     stats: EventStats
-    cache_hit: bool
+    cache_status: CacheStatus
+
+    @property
+    def cache_hit(self) -> bool:
+        return self.cache_status is CacheStatus.HIT
 
 
 def _normalize_time(value: datetime) -> str:
@@ -98,29 +110,32 @@ class EventService:
         """
         cache = self._stats_cache
         if cache is None:
-            return StatsResult(self._compute_stats(filters), cache_hit=False)
+            return StatsResult(self._compute_stats(filters), CacheStatus.MISS)
 
         key = stats_cache_key(filters)
-        cached = self._read_cached_stats(cache, key)
-        if cached is not None:
-            return StatsResult(cached, cache_hit=True)
+        try:
+            raw = cache.get(key)
+        except CacheError as exc:
+            # The cache is unreachable: skip the write too, so an outage costs
+            # one failed cache call per request, not two.
+            logger.warning("Stats cache read failed; using the database: %s", exc)
+            return StatsResult(self._compute_stats(filters), CacheStatus.ERROR)
+
+        if raw is not None:
+            cached = self._parse_cached_stats(key, raw)
+            if cached is not None:
+                return StatsResult(cached, CacheStatus.HIT)
 
         stats = self._compute_stats(filters)
         try:
             cache.set(key, stats.model_dump_json(), self._stats_cache_ttl_seconds)
         except CacheError as exc:
             logger.warning("Stats cache write failed; result not cached: %s", exc)
-        return StatsResult(stats, cache_hit=False)
+        # An unreadable entry counts as an error; it is overwritten above.
+        return StatsResult(stats, CacheStatus.MISS if raw is None else CacheStatus.ERROR)
 
     @staticmethod
-    def _read_cached_stats(cache: Cache, key: str) -> EventStats | None:
-        try:
-            raw = cache.get(key)
-        except CacheError as exc:
-            logger.warning("Stats cache read failed; using the database: %s", exc)
-            return None
-        if raw is None:
-            return None
+    def _parse_cached_stats(key: str, raw: str) -> EventStats | None:
         try:
             return EventStats.model_validate_json(raw)
         except ValidationError:

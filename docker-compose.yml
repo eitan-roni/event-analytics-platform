@@ -12,6 +12,7 @@ x-app: &app
     KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-event-consumer}
     REDIS_URL: redis://redis:6379/0
     STATS_CACHE_TTL_SECONDS: ${STATS_CACHE_TTL_SECONDS:-30}
+    CONSUMER_METRICS_PORT: 9101
 
 services:
   postgres:
@@ -101,6 +102,14 @@ services:
     <<: *app
     ports:
       - "8000:8000"
+    # Liveness only (/health makes no dependency calls); the slim image has
+    # no curl, so use Python.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
       postgres:
         condition: service_healthy
@@ -128,6 +137,18 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: on-failure
+
+  # Scrapes api:8000/metrics and consumer:9101/metrics (docker/prometheus.yml).
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["app"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - api
+      - consumer
 
 volumes:
   postgres_data:

@@ -23,3 +23,5 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 STATS_CACHE_TTL_SECONDS = int(os.getenv("STATS_CACHE_TTL_SECONDS", "30"))
 if STATS_CACHE_TTL_SECONDS < 1:
     raise ValueError("STATS_CACHE_TTL_SECONDS must be at least 1")
+
+CONSUMER_METRICS_PORT = int(os.getenv("CONSUMER_METRICS_PORT", "9101"))

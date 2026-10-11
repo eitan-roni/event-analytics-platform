@@ -11,9 +11,10 @@
 - v0.6 - Redis cache for the stats endpoint (TTL expiry, fail-open)
 - v0.7 - App Docker image (API and consumer), Alembic migrations, pinned
   dependencies
+- v0.8 - Prometheus metrics and readiness checks
 
 ## Planned
-- v0.8 - Prometheus metrics and readiness checks
+- Nothing planned yet.
 
 ## Working agreement
 - One version per commit, message "Implement v0.X <summary>", pushed to main.
