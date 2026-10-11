@@ -30,8 +30,10 @@ an API for downstream consumers.
   process are preserved on `events.dlq` instead of being dropped.
 - **v0.6 — implemented.** Redis cache for `GET /v1/events/stats` (TTL
   expiry, fail-open).
+- **v0.7 — implemented.** One Docker image for the API and the consumer,
+  Alembic migrations, pinned dependencies.
 
-Docker image, migrations, and monitoring are not implemented yet. See
+Metrics and readiness checks are not implemented yet. See
 [docs/ROADMAP.md](docs/ROADMAP.md) for the full plan.
 
 ## Architecture
@@ -138,33 +140,55 @@ container path isn't rewritten into a Windows path.
 ## Project Structure
 
 ```
-app/            - application source code
-  api/          - FastAPI routes
-  services/     - business logic
-  repositories/ - database access
-  messaging/    - Kafka publishers (events, dead letters)
-  cache/        - Redis cache
-  consumer/     - Kafka consumer entry point (python -m app.consumer)
-tests/          - test suite
+app/                 - application source code
+  api/               - FastAPI routes
+  services/          - business logic
+  repositories/      - database access
+  messaging/         - Kafka publishers (events, dead letters)
+  cache/             - Redis cache
+  consumer/          - Kafka consumer entry point (python -m app.consumer)
+migrations/          - Alembic migrations (alembic.ini at the root)
+tests/               - test suite
+docker/              - Postgres init script (creates the test database)
+Dockerfile           - one image for the API, the consumer and migrations
+requirements.txt     - pinned runtime dependencies (installed in the image)
+requirements-dev.txt - runtime + test dependencies
 ```
 
 ## Run
 
-Start PostgreSQL, Redis (`localhost:6379`, no persistence: it only holds
-the cache) and a single-node Kafka broker (KRaft mode, no ZooKeeper,
-reachable at `localhost:9092`):
+`docker compose up -d` starts the infrastructure only: PostgreSQL, Redis
+(`localhost:6379`, no persistence: it only holds the cache) and a
+single-node Kafka broker (KRaft mode, no ZooKeeper, reachable at
+`localhost:9092`). The one-shot `kafka-init` service creates the `events`
+topic with 3 partitions and the `events.dlq` dead-letter topic with 1
+partition (topic auto-creation is disabled on the broker). The broker has no
+volume, so its data is discarded by `docker compose down`; the topics are
+recreated on the next `up`.
+
+Neither the API nor the consumer creates tables: the schema is managed by
+Alembic migrations, which must be applied first. There are two ways to run
+the application.
+
+### Option A: local processes against the compose infrastructure
+
+For development (auto-reload, debugger):
 
 ```
 docker compose up -d
+pip install -r requirements-dev.txt
+alembic upgrade head
+uvicorn app.main:app --reload
 ```
 
-The one-shot `kafka-init` service creates the `events` topic with 3
-partitions and the `events.dlq` dead-letter topic with 1 partition (topic
-auto-creation is disabled on the broker). The broker has no volume, so its
-data is discarded by `docker compose down`; the topics are recreated on the
-next `up`.
+Start the consumer in a second terminal:
 
-Configuration (environment variables, see `.env.example`):
+```
+python -m app.consumer
+```
+
+Configuration (environment variables, see `.env.example`; the defaults
+point at the compose infrastructure on `localhost`):
 
 | Variable                  | Default                                                                 |
 |---------------------------|-------------------------------------------------------------------------|
@@ -176,24 +200,78 @@ Configuration (environment variables, see `.env.example`):
 | `REDIS_URL`               | `redis://localhost:6379/0`                                              |
 | `STATS_CACHE_TTL_SECONDS` | `30` (must be at least 1)                                               |
 
-Start the API:
+### Option B: everything in compose
 
 ```
-uvicorn app.main:app --reload
+docker compose --profile app up -d --build
 ```
 
-Start the consumer in a second terminal:
+This builds one image (`event-analytics-platform:latest`, Python 3.12 slim,
+runtime dependencies only, running as a non-root user) and starts three more
+services from it, configured to use the compose network names (`postgres`,
+`redis`, `kafka:19092`):
+
+- `migrate` runs `alembic upgrade head` once and exits;
+- `api` serves on `http://localhost:8000` (the same port as a local uvicorn,
+  so stop one before starting the other);
+- `consumer` runs `python -m app.consumer` and is restarted by compose when
+  it exits with an error (database or dead-letter failure).
+
+`api` and `consumer` start only after the infrastructure is healthy, the
+topics exist and `migrate` has completed successfully. Follow the logs with
+`docker compose --profile app logs -f api consumer`; stop everything with
+`docker compose --profile app down`.
+
+## Database migrations
+
+The schema is defined by the SQLAlchemy models and created by Alembic
+migrations in `migrations/versions/`. `migrations/env.py` reads
+`DATABASE_URL` from `app/core/config.py`.
+
+After changing a model, generate a migration, review it, and apply it:
 
 ```
-python -m app.consumer
+alembic revision --autogenerate -m "describe the change"
+alembic upgrade head
 ```
 
-The app creates the `events` table on startup if it doesn't exist yet
-(`Base.metadata.create_all`).
+Autogenerate compares the models with the database at `DATABASE_URL`, so
+that database must be at the current head first. Always read the generated
+file; autogenerate does not detect everything (e.g. renames). If you forget
+the migration, `tests/test_migrations.py` fails: it applies all migrations
+to an empty schema in the test database and compares the result with the
+models.
+
+### Moving an existing dev database to Alembic
+
+Before v0.7 the app created the `events` table itself (`create_all`), so an
+existing dev database has the table but no record of migrations, and
+`alembic upgrade head` fails with "relation already exists". Either:
+
+- **Recreate the database** (deletes all data, including the test database,
+  which the init script recreates):
+
+  ```
+  docker compose down -v
+  docker compose up -d
+  alembic upgrade head
+  ```
+
+- **Keep the data** and mark the existing table as migrated:
+
+  ```
+  alembic stamp head
+  ```
+
+  Only do this if the table matches the migration, i.e. it was created by
+  v0.3 or later. Tables from v0.1/v0.2 lack the indexes on `timestamp`,
+  `source` and `event_type` (`\d events` in psql shows them); for those,
+  recreate the database instead.
 
 ## Tests
 
-Set `TEST_DATABASE_URL` (defaults to
+Install the dev requirements (`pip install -r requirements-dev.txt`) and set
+`TEST_DATABASE_URL` (defaults to
 `postgresql+psycopg://postgres:postgres@localhost:5432/event_analytics_test`)
 to a database separate from `DATABASE_URL` — the test suite refuses to run
 otherwise — then:
@@ -202,16 +280,16 @@ otherwise — then:
 pytest
 ```
 
-The test suite creates and drops the schema around the whole run, so it
-always tests against the current models. The default run needs only
-PostgreSQL: the API tests replace the Kafka publisher with an in-memory fake,
-and the consumer's message handling is tested without a broker.
+The test suite creates and drops the schema from the models around the whole
+run, so it always tests against the current models; the migrations are
+checked against the models separately (see above). The default run needs
+only PostgreSQL: the API tests replace the Kafka publisher and the cache with
+in-memory fakes, and the consumer's message handling is tested without a
+broker.
 
 ### Integration tests (Kafka, Redis)
 
-Three tests are marked `integration` and excluded from the default run (the
-default run uses in-memory fakes for Kafka and the cache, so it needs only
-PostgreSQL):
+Three tests are marked `integration` and excluded from the default run:
 
 - POST -> Kafka -> consumer logic -> row in PostgreSQL
 - an invalid message on `events` -> consumer logic -> `events.dlq` with its
@@ -224,16 +302,3 @@ With `docker compose up -d` running:
 ```
 pytest -m integration
 ```
-
-### Recreating the dev database after an index/schema change
-
-`Base.metadata.create_all` only creates tables that don't exist yet — it
-won't add columns or indexes to a table that's already there. v0.3 added
-indexes on `events.timestamp`, `events.source`, and `events.event_type`; if
-your local `events` table predates v0.3, drop it and let the app recreate it:
-
-```
-psql "$DATABASE_URL" -c "DROP TABLE IF EXISTS events;"
-```
-
-Then restart the app. Proper migrations (Alembic) are planned for v0.6.

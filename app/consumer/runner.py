@@ -22,8 +22,7 @@ from app.core.config import (
     KAFKA_EVENTS_TOPIC,
 )
 from app.core.exceptions import PublishError
-from app.db.base import Base
-from app.db.session import SessionLocal, engine
+from app.db.session import SessionLocal
 from app.messaging.dead_letter import DeadLetterPublisher, KafkaDeadLetterPublisher
 from app.repositories.event_repository import EventRepository
 from app.services.event_service import EventService
@@ -119,7 +118,6 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    Base.metadata.create_all(bind=engine)
 
     consumer = Consumer(
         {

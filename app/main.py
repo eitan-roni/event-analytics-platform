@@ -11,14 +11,11 @@ from fastapi.responses import JSONResponse
 from app.api.events import router as events_router
 from app.cache.cache import RedisCache
 from app.core.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_EVENTS_TOPIC, REDIS_URL
-from app.db.base import Base
-from app.db.session import engine
 from app.messaging.publisher import KafkaEventPublisher
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    Base.metadata.create_all(bind=engine)
     publisher = KafkaEventPublisher(KAFKA_BOOTSTRAP_SERVERS, KAFKA_EVENTS_TOPIC)
     app.state.event_publisher = publisher
     stats_cache = RedisCache(REDIS_URL)

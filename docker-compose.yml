@@ -1,3 +1,18 @@
+# Shared settings for the application containers (profile "app"). They reach
+# the infrastructure through the compose network names.
+x-app: &app
+  build: .
+  image: event-analytics-platform:latest
+  profiles: ["app"]
+  environment:
+    DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/event_analytics
+    KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+    KAFKA_EVENTS_TOPIC: ${KAFKA_EVENTS_TOPIC:-events}
+    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-events.dlq}
+    KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-event-consumer}
+    REDIS_URL: redis://redis:6379/0
+    STATS_CACHE_TTL_SECONDS: ${STATS_CACHE_TTL_SECONDS:-30}
+
 services:
   postgres:
     image: postgres:16
@@ -72,6 +87,47 @@ services:
         --create --if-not-exists --topic ${KAFKA_DLQ_TOPIC:-events.dlq}
         --partitions 1 --replication-factor 1
     restart: "no"
+
+  # One-shot job: applies the Alembic migrations before api and consumer start.
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  # Exits non-zero on database or dead-letter failures so the message is
+  # redelivered; compose restarts it.
+  consumer:
+    <<: *app
+    command: ["python", "-m", "app.consumer"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    restart: on-failure
 
 volumes:
   postgres_data:

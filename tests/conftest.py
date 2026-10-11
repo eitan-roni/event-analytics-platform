@@ -165,9 +165,9 @@ def client(
     app.dependency_overrides[get_event_publisher] = lambda: fake_publisher
     app.dependency_overrides[get_stats_cache] = lambda: fake_cache
     # Not entered as a context manager: this deliberately skips the app's
-    # lifespan, which runs create_all against DATABASE_URL (the dev DB) and
-    # creates the real Kafka producer and Redis client. Schema setup for tests
-    # is handled by _test_database_schema; publisher and cache are fakes.
+    # lifespan, which creates the real Kafka producer and Redis client; the
+    # publisher and cache are fakes here. Schema setup for tests is handled by
+    # _test_database_schema.
     try:
         yield TestClient(app)
     finally:
